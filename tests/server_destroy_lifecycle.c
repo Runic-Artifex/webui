@@ -1,4 +1,4 @@
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 199309L
 #endif
 
@@ -9,6 +9,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <unistd.h>
 #else
 #include <time.h>
 #endif
@@ -16,6 +18,8 @@
 static void sleep_ms(unsigned int milliseconds) {
 #ifdef _WIN32
     Sleep(milliseconds);
+#elif defined(__APPLE__)
+    usleep(milliseconds * 1000U);
 #else
     struct timespec duration;
     duration.tv_sec = milliseconds / 1000;
