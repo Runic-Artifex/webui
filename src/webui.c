@@ -386,6 +386,7 @@ typedef struct _webui_window_t {
     // Server
     bool wait; // Let server thread wait more time for websocket
     bool server_running; // Slow check
+    bool server_thread_active; // Full thread lifetime, including startup and cleanup
     bool connected; // Fast check
     size_t server_port;
     char* url;
@@ -662,6 +663,9 @@ static void _webui_wait_for_servers(void);
 static bool _webui_mutex_win_is_exit_now(_webui_window_t* win, int update);
 static bool _webui_mutex_is_webview_update(_webui_window_t* win, int update);
 static bool _webui_mutex_is_server_running(_webui_window_t* win, int update);
+static bool _webui_mutex_try_start_server_thread(_webui_window_t* win);
+static bool _webui_mutex_is_server_thread_active(_webui_window_t* win);
+static void _webui_mutex_server_thread_stopped(_webui_window_t* win);
 static void _webui_condition_init(webui_condition_t* cond);
 static void _webui_condition_wait(webui_condition_t* cond, webui_mutex_t* mutex);
 static void _webui_condition_signal(webui_condition_t* cond);
@@ -1498,42 +1502,18 @@ void webui_destroy(size_t window) {
         return;
     _webui_window_t* win = _webui.wins[window];
 
-    if (_webui_mutex_is_server_running(win, WEBUI_MUTEX_GET_STATUS)) {
+    if (_webui_mutex_is_server_thread_active(win)) {
 
-        // Freindly close
-        webui_close(window);
+        // Ask an established server to close its clients, then signal the
+        // complete server-thread lifetime (including its startup gap) to end.
+        if (_webui_mutex_is_server_running(win, WEBUI_MUTEX_GET_STATUS))
+            webui_close(window);
+        _webui_mutex_win_is_exit_now(win, WEBUI_MUTEX_SET_TRUE);
 
-        // Wait for server threads to stop
-        _webui_timer_t timer_1;
-        _webui_timer_start(&timer_1);
-        for (;;) {
-            _webui_sleep(10);
-            if (!_webui_mutex_is_server_running(win, WEBUI_MUTEX_GET_STATUS))
-                break;
-            if (_webui_timer_is_end(&timer_1, 2500))
-                break;
-        }
-
-        if (_webui_mutex_is_server_running(win, WEBUI_MUTEX_GET_STATUS)) {
-
-            #ifdef WEBUI_LOG
-            _webui_log_info("[User] webui_destroy([%zu]) -> Forced close\n", window);
-            #endif
-
-            // Forced close
-            _webui_mutex_is_connected(win, WEBUI_MUTEX_SET_FALSE);
-
-            // Wait for server threads to stop
-            _webui_timer_t timer_2;
-            _webui_timer_start(&timer_2);
-            for (;;) {
-                _webui_sleep(100);
-                if (!_webui_mutex_is_server_running(win, WEBUI_MUTEX_GET_STATUS))
-                    break;
-                if (_webui_timer_is_end(&timer_2, 1500))
-                    break;
-            }
-        }
+        // The thread still performs cleanup after server_running becomes false.
+        // Do not free the window or its mutexes until its final access is done.
+        while (_webui_mutex_is_server_thread_active(win))
+            _webui_sleep(1);
     }
 
     // Free memory resources
@@ -6388,6 +6368,35 @@ static bool _webui_mutex_is_server_running(_webui_window_t* win, int update) {
     return status;
 }
 
+static bool _webui_mutex_try_start_server_thread(_webui_window_t* win) {
+
+    bool can_start = false;
+    _webui_mutex_lock(&win->mutex_win_server_running);
+    if (!win->server_thread_active) {
+        win->server_thread_active = true;
+        can_start = true;
+    }
+    _webui_mutex_unlock(&win->mutex_win_server_running);
+    return can_start;
+}
+
+static bool _webui_mutex_is_server_thread_active(_webui_window_t* win) {
+
+    bool active;
+    _webui_mutex_lock(&win->mutex_win_server_running);
+    active = win->server_thread_active;
+    _webui_mutex_unlock(&win->mutex_win_server_running);
+    return active;
+}
+
+static void _webui_mutex_server_thread_stopped(_webui_window_t* win) {
+
+    _webui_mutex_lock(&win->mutex_win_server_running);
+    win->server_running = false;
+    win->server_thread_active = false;
+    _webui_mutex_unlock(&win->mutex_win_server_running);
+}
+
 static bool _webui_mutex_win_is_exit_now(_webui_window_t* win, int update) {
 
     bool status = false;
@@ -7833,15 +7842,11 @@ static void _webui_clean(void) {
     // Make sure app is stopped
     webui_exit();
 
-    // Let's give other threads more time to
-    // safely exit and finish cleaning up before
-    // cleaning memory.
-    for (size_t i = 0; i < 4; i++) {
-        _webui_sleep(500);
-        if (_webui_servers_get() < 1) {
-            break; // No more server threads are running
-        }
-    }
+    // Server threads own references to process-wide services and allocations.
+    // Wait for their complete lifetime instead of freeing those resources after
+    // an arbitrary timeout while a slow thread may still be cleaning up.
+    while (_webui_servers_get() > 0)
+        _webui_sleep(1);
 
     // Clean all servers services
     mg_exit_library();
@@ -9145,6 +9150,8 @@ static void _webui_start_server_thread(_webui_window_t* win) {
     // Start the server thread of a window. The thread is counted in before it is
     // created so that `wait()` cannot exit in the gap between this call and the
     // thread actually starting.
+    if (!_webui_mutex_try_start_server_thread(win))
+        return;
 
     _webui_servers_count(+1);
 
@@ -9153,8 +9160,10 @@ static void _webui_start_server_thread(_webui_window_t* win) {
     win->server_thread = thread;
     if (thread != NULL)
         CloseHandle(thread);
-    else
+    else {
+        _webui_mutex_server_thread_stopped(win);
         _webui_servers_count(-1); // Thread creation failed
+    }
     #else
     pthread_t thread;
     if (pthread_create(&thread, NULL, &_webui_server_thread, (void*)win) == 0) {
@@ -9162,6 +9171,7 @@ static void _webui_start_server_thread(_webui_window_t* win) {
         win->server_thread = thread;
     }
     else {
+        _webui_mutex_server_thread_stopped(win);
         _webui_servers_count(-1); // Thread creation failed
     }
     #endif
@@ -10773,10 +10783,12 @@ static WEBUI_THREAD_SERVER_START {
     // Mutex
     _webui_mutex_lock(&_webui.mutex_server_start);
 
+    _webui_window_t* thread_win = (_webui_window_t*)arg;
     _webui_window_t* win = _webui_dereference_win_ptr(arg);
     if (win == NULL || _webui_mutex_is_server_running(win, WEBUI_MUTEX_GET_STATUS)) {
         _webui_mutex_unlock(&_webui.mutex_server_start);
         // This thread was counted in by `_webui_start_server_thread()`
+        _webui_mutex_server_thread_stopped(thread_win);
         _webui_servers_count(-1);
         WEBUI_THREAD_RETURN
     }
@@ -11139,9 +11151,6 @@ static WEBUI_THREAD_SERVER_START {
     _webui_free_port(win->server_port);
     _webui_free_mem((void*)server_port);
 
-    // Mutex
-    _webui_mutex_is_server_running(win, WEBUI_MUTEX_SET_FALSE);
-
     #ifdef WEBUI_LOG
     _webui_log_debug("[Core]\t\t_webui_server_thread([%zu]) -> Server stopped.\n",
         win->num);
@@ -11150,11 +11159,6 @@ static WEBUI_THREAD_SERVER_START {
     // Make window reusable, so user can
     // call `webui_show()` again if needed.
     _webui_make_window_reusable(win);
-
-    // Let the main wait() know that this server thread is finished. This
-    // breaks the main loop when nothing else is left running (no other
-    // server thread, and no `webui_show()` call in progress).
-    _webui_servers_count(-1);
 
     // Clean monitor thread
     if (_webui.config.folder_monitor && monitor_created) {
@@ -11170,6 +11174,15 @@ static WEBUI_THREAD_SERVER_START {
         }
         #endif
     }
+
+    // This must be the final access through the window pointer. destroy() can
+    // free the window and its mutexes as soon as the lifetime flag is cleared.
+    _webui_mutex_server_thread_stopped(win);
+
+    // Let the main wait() know that this server thread is finished. This
+    // breaks the main loop when nothing else is left running (no other
+    // server thread, and no `webui_show()` call in progress).
+    _webui_servers_count(-1);
 
     WEBUI_THREAD_RETURN
 }
