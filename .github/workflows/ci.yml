@@ -20,6 +20,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  server_lifecycle:
+    name: Server lifecycle regression
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DWEBUI_BUILD_EXAMPLES=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
   windows:
     uses: ./.github/workflows/windows.yml
     permissions:

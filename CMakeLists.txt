@@ -93,6 +93,14 @@ endif()
 set_target_properties(webui PROPERTIES
     OUTPUT_NAME ${WEBUI_OUT_LIB_NAME})
 
+include(CTest)
+if (BUILD_TESTING)
+    add_executable(server_destroy_lifecycle_test tests/server_destroy_lifecycle.c)
+    target_link_libraries(server_destroy_lifecycle_test PRIVATE webui)
+    add_test(NAME server_destroy_lifecycle COMMAND server_destroy_lifecycle_test)
+    set_tests_properties(server_destroy_lifecycle PROPERTIES TIMEOUT 30)
+endif()
+
 # Install headers
 install(FILES include/webui.h include/webui.hpp DESTINATION include)
 
